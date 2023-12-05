@@ -22,6 +22,42 @@ type ExampleReply struct {
 	Y int
 }
 
+type GetJobArgs struct {
+
+}
+
+type GetJobReply struct {
+	FileNames []string
+	NReduce int
+	FileNumber int
+	Action string 
+}
+
+type FinishJobArgs struct {
+	FileName string
+}
+
+type FinishJobReply struct {
+
+}
+
+type FinishMapJobArgs struct {
+	FileNumber int
+	ReduceFiles [][]string
+}
+
+type FinishMapJobReply struct {
+
+}
+
+type FinishReduceJobArgs struct {
+	FileNumber int
+}
+
+type FinishReduceJobReply struct {
+	
+}
+
 // Add your RPC definitions here.
 
 

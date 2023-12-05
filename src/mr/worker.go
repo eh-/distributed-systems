@@ -4,6 +4,11 @@ import "fmt"
 import "log"
 import "net/rpc"
 import "hash/fnv"
+import "os"
+import "io/ioutil"
+import "encoding/json"
+import "sort"
+import "time"
 
 
 //
@@ -13,6 +18,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -35,7 +48,111 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
+	
+	for {
+		args := GetJobArgs{}
+		reply := GetJobReply{}
+		call("Coordinator.GetJob", &args, &reply)
 
+		if reply.Action == "map" {
+			mapFiles(mapf, &reply)
+		} else if reply.Action == "reduce" {
+			reduceFiles(reducef, &reply)
+		} else if reply.Action == "wait" {
+			time.Sleep(time.Second)
+		} else if reply.Action == "" {
+			break
+		}
+	}
+}
+
+func mapFiles(mapf func(string, string) []KeyValue, reply *GetJobReply){
+	nReduce := reply.NReduce
+	var intermediates [][]KeyValue = make([][]KeyValue, nReduce)
+	
+	finishMapJobArgs := FinishMapJobArgs{reply.FileNumber, make([][]string, nReduce)}
+	finishMapJobReply := FinishMapJobReply{}
+
+	fileNames := reply.FileNames
+	for _, fileName := range fileNames {
+		file, err := os.Open(fileName)
+		if err != nil {
+			log.Fatalf("cannot open %v", fileName)
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", fileName)
+		}
+		file.Close()
+
+		kva := mapf(fileName, string(content))
+		for _, v := range kva {
+			index := ihash(v.Key) % nReduce
+			intermediates[index] = append(intermediates[index], v)
+		}
+
+		for i, v := range intermediates {
+			intermediateName := fmt.Sprintf("mr-%d-%d", reply.FileNumber, i)
+			intermediateFile, _ := os.Create(intermediateName)
+			enc := json.NewEncoder(intermediateFile)
+			for _, kv := range v {
+				enc.Encode(&kv)
+			}
+			intermediateFile.Close()
+			finishMapJobArgs.ReduceFiles[i] = append(finishMapJobArgs.ReduceFiles[i], intermediateName)
+		}
+	}
+	call("Coordinator.FinishMapJob", &finishMapJobArgs, &finishMapJobReply)
+}
+
+func reduceFiles(reducef func(string, []string) string, reply *GetJobReply){
+	fileNames := reply.FileNames
+	kva := make([]KeyValue, 0)
+	for _, fileName := range fileNames {
+		file, err := os.Open(fileName)
+		if err != nil {
+			log.Fatalf("cannot open %v", fileName)
+		}
+
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+		file.Close()
+	}
+
+	sort.Sort(ByKey(kva))
+
+	outputName := fmt.Sprintf("mr-out-%d", reply.FileNumber)
+	ofile, _ := os.Create(outputName)
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
+	
+	finishReduceJobArgs := FinishReduceJobArgs{reply.FileNumber}
+	finishReduceJobReply := FinishReduceJobReply{}
+	call("Coordinator.FinishReduceJob", &finishReduceJobArgs, &finishReduceJobReply)
 }
 
 //
