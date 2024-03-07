@@ -349,10 +349,6 @@ func (rf *Raft) ticker() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
-		stateCheck := rf.currentState
-		passElectionTimeout := time.Since(rf.lastHeartbeat) > LAST_HEARTBEAT_LIMIT
-		passHeartbeatTimeout := time.Since(rf.sendOutHeartbeat) > SEND_HEARTBEAT_LIMIT
-		
 		if time.Since(rf.lastHeartbeat) > LAST_HEARTBEAT_LIMIT && rf.currentState != LEADER {
 			go rf.StartElection()
 		} else if time.Since(rf.sendOutHeartbeat) > SEND_HEARTBEAT_LIMIT && rf.currentState == LEADER {
