@@ -18,18 +18,19 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 	"sort"
-	//	"6.5840/labgob"
+
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
 const (
-	LAST_HEARTBEAT_LIMIT = time.Millisecond * 1000
+	LAST_HEARTBEAT_LIMIT = time.Millisecond * 500
 	SEND_HEARTBEAT_LIMIT = time.Millisecond * 100
 )
 
@@ -126,6 +127,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 
@@ -147,6 +156,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		rf.currentTerm = 0
+		rf.votedFor = -1
+		rf.log = []LogEntry{ {nil, 0} }
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 
@@ -192,6 +216,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = -1
 		rf.currentTerm = args.Term
 		rf.currentState = FOLLOWER
+		rf.persist()
 	}
 	
 	myLastLogTerm := rf.log[len(rf.log) - 1].Term
@@ -205,6 +230,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	rf.votedFor = args.CandidateId
 	rf.lastHeartbeat = time.Now()
+	rf.persist()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -267,6 +293,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 	}
 	rf.currentState = FOLLOWER
 	
@@ -296,6 +323,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = append(rf.log, args.Entries[i])
 		}
 	}
+	rf.persist()
 
 	if args.LeaderCommit > rf.commitIndex {
 		if args.LeaderCommit < len(rf.log) - 1 {
@@ -342,6 +370,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.log = append(rf.log, LogEntry{command, rf.currentTerm})
 		rf.nextIndex[rf.me] = len(rf.log)
 		rf.matchIndex[rf.me] = len(rf.log) - 1
+		rf.persist()
 		//DPrintf("COMMAND SENT TO %d LEADER IN TERM %d AT INDEX %d", rf.me, term, index)
 	}
 	return index, term, isLeader
@@ -379,8 +408,7 @@ func (rf *Raft) applier() {
 		}
 		rf.mu.Unlock()
 
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		time.Sleep(time.Duration(50) * time.Millisecond)
 	}
 }
 
@@ -404,7 +432,7 @@ func (rf *Raft) ticker() {
 		rf.mu.Unlock()
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		ms := 50 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -416,6 +444,7 @@ func (rf *Raft) StartElection() {
 	rf.votedFor = rf.me
 	rf.currentState = CANDIDATE
 	rf.lastHeartbeat = time.Now()
+	rf.persist()
 
 	votes := 1
 
@@ -455,6 +484,7 @@ func (rf *Raft) StartElection() {
 					rf.currentTerm = reply.Term
 					rf.currentState = FOLLOWER
 					rf.votedFor = -1
+					rf.persist()
 				}
 			}
 		}(i)
@@ -494,13 +524,14 @@ func (rf *Raft) SyncFollowers() {
 					sort.Sort(sort.IntSlice(sortedMatchIndex))
 
 					highestCommit := sortedMatchIndex[len(rf.peers) / 2]
-					if highestCommit > rf.commitIndex {
+					if highestCommit > rf.commitIndex && rf.log[highestCommit].Term == rf.currentTerm {
 						rf.commitIndex = highestCommit
 					}
 				} else if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.votedFor = -1
 					rf.currentState = FOLLOWER
+					rf.persist()
 				} else {
 					if reply.ConflictIndex > 0 {
 						if len(rf.log) < reply.ConflictIndex {
