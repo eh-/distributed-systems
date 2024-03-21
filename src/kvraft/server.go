@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -60,12 +61,14 @@ type KVServer struct {
 	//stateMachine KVStateMachine
 	stateMachine  map[string]string
 	notifyChs     map[int]chan Op
-	resultHistory map[int64]map[int64]*OpResult
+	resultHistory map[int64]map[int64]OpResult
+
+	persister *raft.Persister
 }
 
-func (kv *KVServer) addResult(clientId, commandId int64, result *OpResult) {
+func (kv *KVServer) addResult(clientId, commandId int64, result OpResult) {
 	if kv.resultHistory[clientId] == nil {
-		kv.resultHistory[clientId] = make(map[int64]*OpResult)
+		kv.resultHistory[clientId] = make(map[int64]OpResult)
 	}
 	kv.resultHistory[clientId][commandId] = result
 }
@@ -128,10 +131,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	reply.Err = result.Err
 }
 
-func (kv *KVServer) handleOperation(operation Op) *OpResult {
+func (kv *KVServer) handleOperation(operation Op) OpResult {
 	startIndex, _, isLeader := kv.rf.Start(operation)
 	if !isLeader {
-		return &OpResult{
+		return OpResult{
 			Err: ErrWrongLeader,
 		}
 	}
@@ -148,12 +151,12 @@ func (kv *KVServer) handleOperation(operation Op) *OpResult {
 
 	select {
 	case <-time.After(ExecuteTimeout):
-		return &OpResult{
+		return OpResult{
 			Err: ErrTimeout,
 		}
 	case commitOperation := <-ch:
 		if commitOperation.ClientId != operation.ClientId || commitOperation.CommandId != operation.CommandId {
-			return &OpResult{
+			return OpResult{
 				Err: ErrWrongLeader,
 			}
 		}
@@ -193,6 +196,9 @@ func (kv *KVServer) applier() {
 				operation := applyMsg.Command.(Op)
 				index := applyMsg.CommandIndex
 				kv.mu.Lock()
+				// if kv.lastApplied < index {
+				// 	kv.lastApplied = index
+				// }
 				_, exist := kv.resultHistory[operation.ClientId][operation.CommandId]
 				if !exist {
 					result := kv.databaseExecute(&operation)
@@ -200,6 +206,10 @@ func (kv *KVServer) applier() {
 				}
 
 				ch, exist := kv.notifyChs[index]
+
+				if kv.needSnapshot() {
+					kv.takeSnapshot(index)
+				}
 				kv.mu.Unlock()
 
 				if !exist {
@@ -207,6 +217,13 @@ func (kv *KVServer) applier() {
 				}
 
 				ch <- operation
+			} else if applyMsg.SnapshotValid {
+				kv.mu.Lock()
+				// if kv.lastApplied < applyMsg.SnapshotIndex {
+				// 	kv.lastApplied = applyMsg.SnapshotIndex
+				// }
+				kv.readSnapshot(applyMsg.Snapshot)
+				kv.mu.Unlock()
 			} else {
 				panic("unexpected message in applyCh")
 			}
@@ -214,22 +231,22 @@ func (kv *KVServer) applier() {
 	}
 }
 
-func (kv *KVServer) databaseExecute(op *Op) (res *OpResult) {
+func (kv *KVServer) databaseExecute(op *Op) (res OpResult) {
 	switch op.OpType {
 	case OpGet:
 		if value, ok := kv.stateMachine[op.Key]; ok {
-			return &OpResult{
+			return OpResult{
 				Err:   OK,
 				Value: value,
 			}
 		}
-		return &OpResult{
+		return OpResult{
 			Err:   ErrNoKey,
 			Value: "",
 		}
 	case OpPut:
 		kv.stateMachine[op.Key] = op.Val
-		return &OpResult{
+		return OpResult{
 			Err: OK,
 		}
 	case OpAppend:
@@ -239,11 +256,44 @@ func (kv *KVServer) databaseExecute(op *Op) (res *OpResult) {
 		} else {
 			kv.stateMachine[op.Key] = op.Val
 		}
-		return &OpResult{
+		return OpResult{
 			Err: OK,
 		}
 	}
 	return
+}
+
+func (kv *KVServer) needSnapshot() bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+	currentLength := kv.persister.RaftStateSize()
+	return currentLength/9 >= kv.maxraftstate/10
+}
+
+func (kv *KVServer) takeSnapshot(lastAppliedIndex int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.stateMachine)
+	e.Encode(kv.resultHistory)
+	snapshot := w.Bytes()
+	go kv.rf.Snapshot(lastAppliedIndex, snapshot)
+}
+
+func (kv *KVServer) readSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var stateMachine map[string]string
+	var resultHistory map[int64]map[int64]OpResult
+	if d.Decode(&stateMachine) != nil || d.Decode(&resultHistory) != nil {
+		panic("failed to decode snapshot data")
+	}
+	kv.stateMachine = stateMachine
+	kv.resultHistory = resultHistory
 }
 
 // servers[] contains the ports of the set of
@@ -266,6 +316,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
 
@@ -274,7 +325,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.stateMachine = make(map[string]string)
 	kv.notifyChs = make(map[int]chan Op)
-	kv.resultHistory = make(map[int64]map[int64]*OpResult)
+	kv.resultHistory = make(map[int64]map[int64]OpResult)
+
+	kv.readSnapshot(persister.ReadSnapshot())
 
 	// You may need initialization code here.
 	go kv.applier()
