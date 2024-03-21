@@ -47,6 +47,11 @@ type OpResult struct {
 	Value string
 }
 
+type LastResult struct {
+	CommandId  int64
+	LastResult OpResult
+}
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -55,22 +60,14 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
-	//lastApplied int
 
 	// Your definitions here.
 	//stateMachine KVStateMachine
-	stateMachine  map[string]string
-	notifyChs     map[int]chan Op
-	resultHistory map[int64]map[int64]OpResult
+	stateMachine   map[string]string
+	notifyChs      map[int]chan Op
+	userLastResult map[int64]LastResult
 
 	persister *raft.Persister
-}
-
-func (kv *KVServer) addResult(clientId, commandId int64, result OpResult) {
-	if kv.resultHistory[clientId] == nil {
-		kv.resultHistory[clientId] = make(map[int64]OpResult)
-	}
-	kv.resultHistory[clientId][commandId] = result
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -82,8 +79,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	kv.mu.Lock()
-	if result, exist := kv.resultHistory[args.ClientId][args.CommandId]; exist {
-		reply.Err, reply.Value = result.Err, result.Value
+	if lastResult, exist := kv.userLastResult[args.ClientId]; exist && lastResult.CommandId == args.CommandId {
+		reply.Err, reply.Value = lastResult.LastResult.Err, lastResult.LastResult.Value
+		kv.mu.Unlock()
+		return
+	} else if exist && lastResult.CommandId > args.CommandId {
+		reply.Err = ErrTimeout
 		kv.mu.Unlock()
 		return
 	}
@@ -109,8 +110,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	kv.mu.Lock()
-	if result, exist := kv.resultHistory[args.ClientId][args.CommandId]; exist {
-		reply.Err = result.Err
+	if lastResult, exist := kv.userLastResult[args.ClientId]; exist && lastResult.CommandId == args.CommandId {
+		reply.Err = lastResult.LastResult.Err
+		kv.mu.Unlock()
+		return
+	} else if exist && lastResult.CommandId > args.CommandId {
+		reply.Err = ErrTimeout
 		kv.mu.Unlock()
 		return
 	}
@@ -162,9 +167,15 @@ func (kv *KVServer) handleOperation(operation Op) OpResult {
 		}
 
 		kv.mu.Lock()
-		result := kv.resultHistory[commitOperation.ClientId][commitOperation.CommandId]
+		lastResult, exist := kv.userLastResult[commitOperation.ClientId]
+		if !exist || lastResult.CommandId != commitOperation.CommandId {
+			kv.mu.Unlock()
+			return OpResult{
+				Err: ErrTimeout,
+			}
+		}
 		kv.mu.Unlock()
-		return result
+		return lastResult.LastResult
 	}
 }
 
@@ -199,10 +210,13 @@ func (kv *KVServer) applier() {
 				// if kv.lastApplied < index {
 				// 	kv.lastApplied = index
 				// }
-				_, exist := kv.resultHistory[operation.ClientId][operation.CommandId]
-				if !exist {
+				lastResult, exist := kv.userLastResult[operation.ClientId]
+				if !exist || lastResult.CommandId < operation.CommandId {
 					result := kv.databaseExecute(&operation)
-					kv.addResult(operation.ClientId, operation.CommandId, result)
+					kv.userLastResult[operation.ClientId] = LastResult{
+						CommandId:  operation.CommandId,
+						LastResult: result,
+					}
 				}
 
 				ch, exist := kv.notifyChs[index]
@@ -275,7 +289,7 @@ func (kv *KVServer) takeSnapshot(lastAppliedIndex int) {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.stateMachine)
-	e.Encode(kv.resultHistory)
+	e.Encode(kv.userLastResult)
 	snapshot := w.Bytes()
 	go kv.rf.Snapshot(lastAppliedIndex, snapshot)
 }
@@ -288,12 +302,12 @@ func (kv *KVServer) readSnapshot(snapshot []byte) {
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 	var stateMachine map[string]string
-	var resultHistory map[int64]map[int64]OpResult
-	if d.Decode(&stateMachine) != nil || d.Decode(&resultHistory) != nil {
+	var userLastResult map[int64]LastResult
+	if d.Decode(&stateMachine) != nil || d.Decode(&userLastResult) != nil {
 		panic("failed to decode snapshot data")
 	}
 	kv.stateMachine = stateMachine
-	kv.resultHistory = resultHistory
+	kv.userLastResult = userLastResult
 }
 
 // servers[] contains the ports of the set of
@@ -325,7 +339,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.stateMachine = make(map[string]string)
 	kv.notifyChs = make(map[int]chan Op)
-	kv.resultHistory = make(map[int64]map[int64]OpResult)
+	kv.userLastResult = make(map[int64]LastResult)
 
 	kv.readSnapshot(persister.ReadSnapshot())
 
