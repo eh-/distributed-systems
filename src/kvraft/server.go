@@ -4,6 +4,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -25,6 +26,8 @@ const (
 	OpGet OType = iota
 	OpPut
 	OpAppend
+
+	ExecuteTimeout = time.Millisecond * 1000
 )
 
 type Op struct {
@@ -43,37 +46,6 @@ type OpResult struct {
 	Value string
 }
 
-// type KVStateMachine interface {
-// 	Get(key string) (string, Err)
-// 	Put(key, value string) Err
-// 	Append(kev, value string) Err
-// }
-
-// type MemoryKV struct {
-// 	KV map[string]string
-// }
-
-// func NewMemoryKV() *MemoryKV {
-// 	return &MemoryKV{make(map[string]string)}
-// }
-
-// func (mKV *MemoryKV) Get(key string) (string, Err) {
-// 	if value, ok := mKV.KV[key]; ok {
-// 		return value, OK
-// 	}
-// 	return "", ErrNoKey
-// }
-
-// func (mKV *MemoryKV) Put(key, value string) Err {
-// 	mKV.KV[key] = value
-// 	return OK
-// }
-
-// func (mKV *MemoryKV) Append(key, value string) Err {
-// 	mKV.KV[key] += value
-// 	return OK
-// }
-
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -86,94 +58,111 @@ type KVServer struct {
 
 	// Your definitions here.
 	//stateMachine KVStateMachine
-	stateMachine map[string]string
-	notifyChs    map[int64]map[int64]chan *OpResult
-	//commandRes map[int64]map[int64] *result
+	stateMachine  map[string]string
+	notifyChs     map[int]chan Op
+	resultHistory map[int64]map[int64]*OpResult
 }
 
-func (kv *KVServer) addChannel(clientId int64, commandId int64, ch chan *OpResult) {
-	if kv.notifyChs[clientId] == nil {
-		kv.notifyChs[clientId] = make(map[int64]chan *OpResult)
+func (kv *KVServer) addResult(clientId, commandId int64, result *OpResult) {
+	if kv.resultHistory[clientId] == nil {
+		kv.resultHistory[clientId] = make(map[int64]*OpResult)
 	}
-	kv.notifyChs[clientId][commandId] = ch
+	kv.resultHistory[clientId][commandId] = result
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	if result, exist := kv.resultHistory[args.ClientId][args.CommandId]; exist {
+		reply.Err, reply.Value = result.Err, result.Value
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
 	op := Op{
 		OpType:    OpGet,
 		Key:       args.Key,
 		ClientId:  args.ClientId,
 		CommandId: args.CommandId,
 	}
-	_, _, isLeader := kv.rf.Start(op)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-	kv.mu.Lock()
-	ch := make(chan *OpResult)
-	kv.addChannel(args.ClientId, args.CommandId, ch)
-	kv.mu.Unlock()
-
-	select {
-	case result := <-ch:
-		reply.Err, reply.Value = result.Err, result.Value
-	}
+	result := kv.handleOperation(op)
+	reply.Err, reply.Value = result.Err, result.Value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	if result, exist := kv.resultHistory[args.ClientId][args.CommandId]; exist {
+		reply.Err = result.Err
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
 	op := Op{
 		Key:       args.Key,
 		Val:       args.Value,
-		CommandId: args.CommandId,
 		ClientId:  args.ClientId,
+		CommandId: args.CommandId,
 	}
 	if args.Op == "Put" {
 		op.OpType = OpPut
 	} else {
 		op.OpType = OpAppend
 	}
-	_, _, isLeader := kv.rf.Start(op)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-	kv.mu.Lock()
-	ch := make(chan *OpResult)
-	kv.addChannel(args.ClientId, args.CommandId, ch)
-	kv.mu.Unlock()
-
-	result := <-ch
+	result := kv.handleOperation(op)
 	reply.Err = result.Err
 }
 
-func (kv *KVServer) databaseExecute(op *Op) (res OpResult) {
-	switch op.OpType {
-	case OpGet:
-		if value, ok := kv.stateMachine[op.Key]; ok {
-			return OpResult{
-				Value: value,
-				Err:   OK,
-			}
-		}
-		return OpResult{
-			Value: "",
-			Err:   ErrNoKey,
-		}
-	case OpPut:
-		kv.stateMachine[op.Key] = op.Val
-		return OpResult{
-			Err: OK,
-		}
-	case OpAppend:
-		kv.stateMachine[op.Key] += op.Val
-		return OpResult{
-			Err: OK,
+func (kv *KVServer) handleOperation(operation Op) *OpResult {
+	startIndex, _, isLeader := kv.rf.Start(operation)
+	if !isLeader {
+		return &OpResult{
+			Err: ErrWrongLeader,
 		}
 	}
-	return
+	kv.mu.Lock()
+	ch := make(chan Op)
+	kv.notifyChs[startIndex] = ch
+	kv.mu.Unlock()
+
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.notifyChs, startIndex)
+		kv.mu.Unlock()
+	}()
+
+	select {
+	case <-time.After(ExecuteTimeout):
+		return &OpResult{
+			Err: ErrTimeout,
+		}
+	case commitOperation := <-ch:
+		if commitOperation.ClientId != operation.ClientId || commitOperation.CommandId != operation.CommandId {
+			return &OpResult{
+				Err: ErrWrongLeader,
+			}
+		}
+
+		kv.mu.Lock()
+		result := kv.resultHistory[commitOperation.ClientId][commitOperation.CommandId]
+		kv.mu.Unlock()
+		return result
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -200,17 +189,61 @@ func (kv *KVServer) applier() {
 		select {
 		case applyMsg := <-kv.applyCh:
 			if applyMsg.CommandValid {
-				kv.mu.Lock()
+
 				operation := applyMsg.Command.(Op)
-				result := kv.databaseExecute(&operation)
-				ch := kv.notifyChs[operation.ClientId][operation.CommandId]
-				ch <- &result
+				index := applyMsg.CommandIndex
+				kv.mu.Lock()
+				_, exist := kv.resultHistory[operation.ClientId][operation.CommandId]
+				if !exist {
+					result := kv.databaseExecute(&operation)
+					kv.addResult(operation.ClientId, operation.CommandId, result)
+				}
+
+				ch, exist := kv.notifyChs[index]
 				kv.mu.Unlock()
+
+				if !exist {
+					continue
+				}
+
+				ch <- operation
 			} else {
 				panic("unexpected message in applyCh")
 			}
 		}
 	}
+}
+
+func (kv *KVServer) databaseExecute(op *Op) (res *OpResult) {
+	switch op.OpType {
+	case OpGet:
+		if value, ok := kv.stateMachine[op.Key]; ok {
+			return &OpResult{
+				Err:   OK,
+				Value: value,
+			}
+		}
+		return &OpResult{
+			Err:   ErrNoKey,
+			Value: "",
+		}
+	case OpPut:
+		kv.stateMachine[op.Key] = op.Val
+		return &OpResult{
+			Err: OK,
+		}
+	case OpAppend:
+		value, ok := kv.stateMachine[op.Key]
+		if ok {
+			kv.stateMachine[op.Key] = value + op.Val
+		} else {
+			kv.stateMachine[op.Key] = op.Val
+		}
+		return &OpResult{
+			Err: OK,
+		}
+	}
+	return
 }
 
 // servers[] contains the ports of the set of
@@ -240,7 +273,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.stateMachine = make(map[string]string)
-	kv.notifyChs = make(map[int64]map[int64]chan *OpResult)
+	kv.notifyChs = make(map[int]chan Op)
+	kv.resultHistory = make(map[int64]map[int64]*OpResult)
 
 	// You may need initialization code here.
 	go kv.applier()

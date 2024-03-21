@@ -27,8 +27,14 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 		servers:   servers,
 		leaderId:  0,
 		clientId:  nrand(),
-		commandId: 0,
+		commandId: 1,
 	}
+}
+
+func (ck *Clerk) getUniqueCommandId() int64 {
+	commandId := ck.commandId
+	ck.commandId++
+	return commandId
 }
 
 // fetch the current value for a key.
@@ -45,7 +51,7 @@ func (ck *Clerk) Get(key string) string {
 	args := &GetArgs{
 		Key:       key,
 		ClientId:  ck.clientId,
-		CommandId: ck.commandId,
+		CommandId: ck.getUniqueCommandId(),
 	}
 
 	for {
@@ -54,7 +60,6 @@ func (ck *Clerk) Get(key string) string {
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 			continue
 		}
-		ck.commandId++
 		if reply.Err == ErrNoKey {
 			return ""
 		}
@@ -76,7 +81,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Value:     value,
 		Op:        op,
 		ClientId:  ck.clientId,
-		CommandId: ck.commandId,
+		CommandId: ck.getUniqueCommandId(),
 	}
 
 	for {
@@ -85,7 +90,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 			continue
 		}
-		ck.commandId++
 		break
 	}
 }
